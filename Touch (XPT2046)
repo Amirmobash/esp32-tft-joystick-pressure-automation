@@ -1,0 +1,670 @@
+/*******************************************************
+ * Amir – Drahtrichter UI (Portrait 240x320)
+ * ESP32 + ILI9341 (TFT_eSPI) + Touch (XPT2046 / FT6206)
+ * Joystick, Relais, Honeywell PX2 (I2C)
+ * Autor: Amir Mobasheraghdam
+ *******************************************************/
+
+#include <TFT_eSPI.h>
+#include <Wire.h>
+
+// ---- OPTIONAL: Für kapazitiven Touch FT6206 aktivieren ----
+// #define USE_CAP_TOUCH
+#ifdef USE_CAP_TOUCH
+  #include <Adafruit_FT6206.h>
+  Adafruit_FT6206 ctp;
+#endif
+
+/***************** Hardware-Pins *****************/
+#define JOY_Y       34       // Joystick Y (ADC)
+#define JOY_X       35       // Joystick X (ADC)
+#define JOY_SW      27       // Joystick Taster (LOW-aktiv)
+#define SENSOR_PIN  33       // Digitaler Eingang (Sensor)
+#define RELAY_PIN   25       // Relaisausgang
+
+/******** Honeywell PX2 (I2C) ********/
+#define PRESSURE_SENSOR_ADDR 0x28
+#define PRESSURE_MIN 0.0f
+#define PRESSURE_MAX 1034.21f     // 150 psi ≈ 1034.21 kPa
+#define TARGET_MIN  400.0f
+#define TARGET_MAX  500.0f
+
+/******** Relais-Logik ********/
+#define RELAY_ON   LOW
+#define RELAY_OFF  HIGH
+
+/******** Zeitkonstanten (ms) ********/
+const uint16_t SENSOR_DURATION   = 10000;
+const uint16_t JOYSTICK_DURATION = 4000;
+const uint16_t AUTO_ON_TIME      = 5000;
+const uint16_t AUTO_OFF_TIME     = 2000;
+
+/******** Display / Farben (BGR-Panel) ********/
+#define PORTRAIT_ROTATION 0    // 0 oder 2 = Hochformat
+
+#define ORANGE_DARK    0x02BF
+#define ORANGE_MAIN    0x02BF
+#define ORANGE_LIGHT   0x02FF
+#define ORANGE_ACCENT  0x04FF
+#define ORANGE_BG      0x003F
+#define COLOR_TEXT     TFT_WHITE
+#define COLOR_OK       0x07E0
+#define COLOR_BAD      0x00F8
+#define COLOR_FRAME    TFT_BLACK
+
+/******** Joystick-Optionen ********/
+#define INVERT_X false
+#define INVERT_Y true
+const int ADC_MIN = 0, ADC_MAX = 4095, ADC_CENTER = 2048;
+const int DEADZONE = 160;
+const int NAV_THRESHOLD = 450;
+const uint16_t NAV_REPEAT_MS = 180;
+
+/******** UI-Layout (240x320 Portrait) ********/
+const int HDR_H = 44;
+const int FTR_H = 26;
+const int SIDE_PAD = 12;
+
+/******** Globale Zustände ********/
+TFT_eSPI tft;
+const char* menuItems[] = { "Sensor-Modus", "Joystick-Modus", "Auto-Modus", "Druck-Anzeige" };
+const uint8_t menuCount = sizeof(menuItems) / sizeof(menuItems[0]);
+uint8_t currentSelection = 0;
+int8_t  activeMode = -1;
+
+bool relayActive = false;
+unsigned long relayTimer = 0;
+float currentPressure = 0.0f;
+
+unsigned long lastButtonPress = 0;
+unsigned long lastNavTime = 0;
+uint8_t buttonClickCount = 0;
+unsigned long lastClickTime = 0;
+
+/********* Touch-Kalibrierung (XPT2046) *********
+ * Diese 5 Werte kommen aus dem Beispiel "Touch_calibrate"
+ * der TFT_eSPI-Bibliothek. Bitte nach Kalibrierung eintragen!
+ */
+#ifndef USE_CAP_TOUCH
+uint16_t calData[5] = { 370, 3530, 370, 3490, 7 }; // <-- Beispielwerte: durch eigene ersetzen!
+#endif
+
+/********* Funktions-Prototypen *********/
+void drawMainMenu();
+void drawHeader();
+void drawFooter(const char* text);
+void drawMenuList();
+void drawMenuItem(int y, const char* label, bool selected);
+
+void drawPressureBadgeInHeader(float kPa);
+
+void handleMainMenu(int joyY, int lastJoyY);
+void handleButtonPress();
+bool canExitCurrentMode();
+
+void showModeStartScreen(const char* modeName);
+void drawSensorModeUI();
+void runSensorMode();
+void drawJoystickModeUI();
+void runJoystickMode();
+void drawAutoModeUI();
+void runAutoMode();
+void drawPressureDisplayUI();
+void runPressureDisplay();
+
+float readPressureSensor();
+void drawProgressBar(int cx, int y, int w, int h, float pct, uint16_t color, uint16_t bg);
+void activateRelay(uint16_t ms);
+void checkRelayTimer();
+
+/********* Touch-Helfer *********/
+void handleTouchMainMenu();
+bool getTouch(uint16_t &x, uint16_t &y);
+
+/***************** Setup *****************/
+void setup() {
+  Serial.begin(115200);
+  Wire.begin();                  // I2C (PX2 + ggf. FT6206)
+
+  pinMode(JOY_SW, INPUT_PULLUP);
+  pinMode(SENSOR_PIN, INPUT);
+  pinMode(RELAY_PIN, OUTPUT);
+  digitalWrite(RELAY_PIN, RELAY_OFF);
+
+  tft.init();
+  tft.setRotation(PORTRAIT_ROTATION);
+  tft.fillScreen(ORANGE_BG);
+
+#ifndef USE_CAP_TOUCH
+  // Resistiver Touch (XPT2046) – Kalibrierwerte setzen
+  tft.setTouch(calData);
+#else
+  // Kapazitiver Touch (FT6206)
+  if (!ctp.begin(40)) {
+    Serial.println("FT6206 nicht gefunden – Touch deaktiviert.");
+  }
+#endif
+
+  drawMainMenu();
+}
+
+/***************** Loop *****************/
+void loop() {
+  static int lastJoyY = analogRead(JOY_Y);
+
+  int joyX = analogRead(JOY_X);
+  int joyY = analogRead(JOY_Y);
+  if (INVERT_X) joyX = ADC_MAX - joyX;
+  if (INVERT_Y) joyY = ADC_MAX - joyY;
+
+  bool buttonPressed = (digitalRead(JOY_SW) == LOW);
+
+  // Drucksensor lesen
+  currentPressure = readPressureSensor();
+
+  // Taster-Clicks zählen (Single / Triple für Zurück)
+  if (buttonPressed && millis() - lastButtonPress > 300) {
+    handleButtonPress();
+    lastButtonPress = millis();
+  }
+
+  // Touch im Hauptmenü erlauben
+  if (activeMode == -1) {
+    handleTouchMainMenu();
+  }
+
+  switch (activeMode) {
+    case 0: runSensorMode();      break;
+    case 1: runJoystickMode();    break;
+    case 2: runAutoMode();        break;
+    case 3: runPressureDisplay(); break;
+    default: handleMainMenu(joyY, lastJoyY);
+  }
+
+  lastJoyY = joyY;
+}
+
+/*********** Druck lesen (Honeywell PX2) ***********/
+float readPressureSensor() {
+  Wire.requestFrom(PRESSURE_SENSOR_ADDR, 4);
+  if (Wire.available() >= 4) {
+    uint8_t b0 = Wire.read();
+    uint8_t b1 = Wire.read();
+    (void)Wire.read(); // Temperatur (ungenutzt)
+    (void)Wire.read(); // Prüfsumme (ungenutzt)
+
+    uint16_t raw = ((uint16_t)(b0 & 0x3F) << 8) | b1;  // 14 Bit
+
+    const float OUT_MIN = 1638.0f;
+    const float OUT_MAX = 14745.0f;
+    float pct = (raw - OUT_MIN) / (OUT_MAX - OUT_MIN);
+    if (pct < 0.0f) pct = 0.0f;
+    if (pct > 1.0f) pct = 1.0f;
+
+    float kPa = PRESSURE_MIN + pct * (PRESSURE_MAX - PRESSURE_MIN);
+    return kPa;
+  }
+  return -1.0f; // kein Sensor
+}
+
+/*********** Button-Logik ***********/
+void handleButtonPress() {
+  if (millis() - lastClickTime < 500) buttonClickCount++;
+  else buttonClickCount = 1;
+  lastClickTime = millis();
+
+  if (activeMode == -1) {
+    if (buttonClickCount == 1) {
+      activeMode = currentSelection;
+      showModeStartScreen(menuItems[currentSelection]);
+    }
+  } else {
+    if (buttonClickCount >= 3 && canExitCurrentMode()) {
+      activeMode = -1;
+      buttonClickCount = 0;
+      drawMainMenu();
+    }
+  }
+}
+
+bool canExitCurrentMode() {
+  // Im Auto-Modus nur zurück, wenn Relais AUS ist
+  return (activeMode != 2) || !relayActive;
+}
+
+/*********** Joystick-Menüführung ***********/
+void handleMainMenu(int joyY, int lastJoyY) {
+  int dy = joyY - ADC_CENTER;
+  if (abs(dy) > DEADZONE && millis() - lastNavTime > NAV_REPEAT_MS) {
+    if (dy > NAV_THRESHOLD) {
+      currentSelection = (currentSelection == 0) ? (menuCount - 1) : (currentSelection - 1);
+      drawMenuList();
+      lastNavTime = millis();
+    } else if (dy < -NAV_THRESHOLD) {
+      currentSelection = (currentSelection + 1) % menuCount;
+      drawMenuList();
+      lastNavTime = millis();
+    }
+  }
+  drawHeader(); // Header (Druck/Relais) aktuell halten
+}
+
+/*********** UI: Hauptmenü ***********/
+void drawMainMenu() {
+  tft.fillScreen(ORANGE_BG);
+  drawHeader();
+  drawMenuList();
+  drawFooter("1x Klick: Start  |  3x Klick: Zurück");
+}
+
+void drawHeader() {
+  int W = tft.width(), H = tft.height();
+  tft.fillRect(0, 0, W, HDR_H, ORANGE_MAIN);
+
+  tft.setTextColor(COLOR_TEXT, ORANGE_MAIN);
+  tft.setTextDatum(TL_DATUM);
+  tft.setTextSize(2);
+  tft.drawString("Amir – Drahtrichter", SIDE_PAD, 8);
+
+  // Status rechts
+  tft.setTextDatum(TR_DATUM);
+  tft.drawString(relayActive ? "Aktiv" : "Leerlauf", W - SIDE_PAD, 8);
+
+  // Druck-Badge
+  drawPressureBadgeInHeader(currentPressure);
+}
+
+void drawMenuList() {
+  int W = tft.width(), H = tft.height();
+  tft.fillRect(0, HDR_H, W, H - HDR_H - FTR_H, ORANGE_BG);
+
+  int itemH = 44;
+  int gap   = 10;
+  int totalH = (itemH * menuCount) + (gap * (menuCount - 1));
+  int startY = HDR_H + ((H - HDR_H - FTR_H) - totalH) / 2;
+
+  for (uint8_t i = 0; i < menuCount; i++) {
+    int y = startY + i * (itemH + gap);
+    drawMenuItem(y, menuItems[i], (i == currentSelection));
+  }
+}
+
+void drawMenuItem(int y, const char* label, bool selected) {
+  int W = tft.width();
+  int x = SIDE_PAD, w = W - 2*SIDE_PAD, h = 44, r = 10;
+
+  if (selected) {
+    tft.fillRoundRect(x, y, w, h, r, ORANGE_ACCENT);
+    tft.drawRoundRect(x, y, w, h, r, ORANGE_DARK);
+    tft.setTextColor(TFT_BLACK, ORANGE_ACCENT);
+  } else {
+    tft.fillRoundRect(x, y, w, h, r, ORANGE_BG);
+    tft.drawRoundRect(x, y, w, h, r, ORANGE_DARK);
+    tft.setTextColor(COLOR_TEXT, ORANGE_BG);
+  }
+
+  tft.setTextSize(2);
+  tft.setTextDatum(ML_DATUM);
+  tft.drawString(label, x + 10, y + h/2);
+}
+
+void drawFooter(const char* text) {
+  int W = tft.width(), H = tft.height();
+  tft.fillRect(0, H - FTR_H, W, FTR_H, ORANGE_DARK);
+  tft.setTextColor(COLOR_TEXT, ORANGE_DARK);
+  tft.setTextSize(1);
+  tft.setTextDatum(MC_DATUM);
+  tft.drawString(text, W/2, H - FTR_H/2);
+}
+
+// Header-Druck-Miniwidget
+void drawPressureBadgeInHeader(float kPa) {
+  int W = tft.width();
+  int x = W - 128 - SIDE_PAD, y = 22, w = 128, h = 18, r = 9;
+
+  tft.fillRect(x, y, w, h, ORANGE_MAIN);
+
+  if (kPa < 0) {
+    tft.setTextDatum(TR_DATUM);
+    tft.setTextColor(COLOR_TEXT, ORANGE_MAIN);
+    tft.drawString("Kein Sensor", W - SIDE_PAD, 24);
+    return;
+  }
+
+  bool ok = (kPa >= TARGET_MIN && kPa <= TARGET_MAX);
+  uint16_t bg = ok ? COLOR_OK : COLOR_BAD;
+
+  tft.fillRoundRect(x, y, w, h, r, bg);
+  tft.drawRoundRect(x, y, w, h, r, TFT_BLACK);
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextSize(1);
+  tft.setTextColor(TFT_BLACK, bg);
+
+  char buf[28];
+  snprintf(buf, sizeof(buf), "%s  |  %.0f kPa", ok ? "Druck OK" : "Druck !", kPa);
+  tft.drawString(buf, x + w/2, y + h/2);
+}
+
+/*********** Modus-Startbild ***********/
+void showModeStartScreen(const char* modeName) {
+  int W = tft.width();
+  tft.fillScreen(ORANGE_DARK);
+  tft.fillRoundRect(SIDE_PAD, HDR_H + 10, W - 2*SIDE_PAD, 80, 12, ORANGE_ACCENT);
+  tft.setTextColor(TFT_BLACK, ORANGE_ACCENT);
+  tft.setTextSize(3);
+  tft.setTextDatum(MC_DATUM);
+  tft.drawString(modeName, W/2, HDR_H + 50);
+  tft.setTextDatum(TL_DATUM);
+  delay(350);
+
+  switch (activeMode) {
+    case 0: drawSensorModeUI();       break;
+    case 1: drawJoystickModeUI();     break;
+    case 2: drawAutoModeUI();         break;
+    case 3: drawPressureDisplayUI();  break;
+  }
+}
+
+/*********** Sensor-Modus ***********/
+void drawSensorModeUI() {
+  tft.fillScreen(ORANGE_BG);
+  drawHeader();
+
+  tft.setTextColor(COLOR_TEXT, ORANGE_BG);
+  tft.setTextSize(2);
+  tft.setTextDatum(TL_DATUM);
+  tft.drawString("SENSOR-MODUS", SIDE_PAD, HDR_H + 8);
+  tft.drawFastHLine(SIDE_PAD, HDR_H + 28, tft.width() - 2*SIDE_PAD, ORANGE_ACCENT);
+
+  drawFooter("\x1A  3x Klick: Zurück");
+}
+
+void runSensorMode() {
+  static bool sensorActive = false;
+
+  if (digitalRead(SENSOR_PIN) == HIGH && !relayActive) {
+    activateRelay(SENSOR_DURATION);
+    sensorActive = true;
+
+    tft.fillRoundRect(SIDE_PAD, HDR_H + 40, tft.width()-2*SIDE_PAD, 44, 10, ORANGE_ACCENT);
+    tft.setTextColor(TFT_BLACK, ORANGE_ACCENT);
+    tft.setTextSize(3);
+    tft.setTextDatum(MC_DATUM);
+    tft.drawString("AKTIVIERT!", tft.width()/2, HDR_H + 62);
+    tft.setTextDatum(TL_DATUM);
+  }
+
+  if (relayActive) {
+    float remain = (relayTimer - millis()) / 1000.0f;
+    drawProgressBar(tft.width()/2, HDR_H + 110, tft.width()-2*SIDE_PAD, 12,
+                    remain / (SENSOR_DURATION/1000.0f), ORANGE_ACCENT, ORANGE_DARK);
+  } else if (sensorActive) {
+    sensorActive = false;
+    drawSensorModeUI();
+  }
+
+  checkRelayTimer();
+}
+
+/*********** Joystick-Modus ***********/
+void drawJoystickModeUI() {
+  tft.fillScreen(ORANGE_BG);
+  drawHeader();
+
+  tft.setTextColor(COLOR_TEXT, ORANGE_BG);
+  tft.setTextSize(2);
+  tft.drawString("JOYSTICK-MODUS", SIDE_PAD, HDR_H + 8);
+  tft.drawFastHLine(SIDE_PAD, HDR_H + 28, tft.width() - 2*SIDE_PAD, ORANGE_ACCENT);
+
+  // Pad
+  int cx = tft.width()/2, cy = HDR_H + 120;
+  tft.fillRoundRect(cx-60, cy-60, 120, 120, 20, ORANGE_DARK);
+  tft.fillCircle(cx, cy, 36, ORANGE_BG);
+
+  drawFooter("DOWN = Aktivieren  |  3x Klick: Zurück");
+}
+
+void runJoystickMode() {
+  static unsigned long lastTrigger = 0;
+  static bool wasActive = false;
+
+  int joyX = analogRead(JOY_X);
+  int joyY = analogRead(JOY_Y);
+  if (INVERT_X) joyX = ADC_MAX - joyX;
+  if (INVERT_Y) joyY = ADC_MAX - joyY;
+
+  int cx = tft.width()/2, cy = HDR_H + 120;
+
+  // Stick neu zeichnen
+  tft.fillCircle(cx, cy, 36, ORANGE_BG);
+  int xPos = map(joyX, ADC_MIN, ADC_MAX, cx-30, cx+30);
+  int yPos = map(joyY, ADC_MIN, ADC_MAX, cy-30, cy+30);
+  tft.fillCircle(xPos, yPos, 14, ORANGE_ACCENT);
+
+  // Langer Druck = zurück (nur wenn Relais AUS)
+  if (digitalRead(JOY_SW) == LOW && millis() - lastButtonPress > 800 && !relayActive) {
+    activeMode = -1;
+    drawMainMenu();
+    return;
+  }
+
+  // Aktivieren bei "DOWN"
+  if (!relayActive && millis() - lastTrigger > 500 && joyY > 3000) {
+    activateRelay(JOYSTICK_DURATION);
+    lastTrigger = millis();
+    wasActive = true;
+
+    tft.fillRoundRect(SIDE_PAD, HDR_H + 48, tft.width()-2*SIDE_PAD, 36, 10, ORANGE_ACCENT);
+    tft.setTextColor(TFT_BLACK, ORANGE_ACCENT);
+    tft.setTextSize(3);
+    tft.setTextDatum(MC_DATUM);
+    tft.drawString("AKTIV!", tft.width()/2, HDR_H + 66);
+    tft.setTextDatum(TL_DATUM);
+  }
+
+  if (relayActive) {
+    float remain = (relayTimer - millis()) / 1000.0f;
+    drawProgressBar(tft.width()/2, HDR_H + 200, tft.width()-2*SIDE_PAD, 12,
+                    remain / (JOYSTICK_DURATION/1000.0f), ORANGE_ACCENT, ORANGE_DARK);
+  } else if (wasActive) {
+    wasActive = false;
+    drawJoystickModeUI();
+  }
+
+  checkRelayTimer();
+}
+
+/*********** Auto-Puls-Modus ***********/
+void drawAutoModeUI() {
+  tft.fillScreen(ORANGE_BG);
+  drawHeader();
+
+  tft.setTextColor(COLOR_TEXT, ORANGE_BG);
+  tft.setTextSize(2);
+  tft.drawString("AUTO-PULS-MODUS", SIDE_PAD, HDR_H + 8);
+  tft.drawFastHLine(SIDE_PAD, HDR_H + 28, tft.width() - 2*SIDE_PAD, ORANGE_ACCENT);
+  drawFooter("3x Klick Zurück (nur wenn AUS)");
+}
+
+void runAutoMode() {
+  static bool autoState = false;
+  static unsigned long autoTimer = 0;
+  static bool firstRun = true;
+
+  if (firstRun) { drawAutoModeUI(); firstRun = false; }
+
+  uint16_t interval = autoState ? AUTO_ON_TIME : AUTO_OFF_TIME;
+  if (millis() - autoTimer >= interval) {
+    autoState = !autoState;
+    digitalWrite(RELAY_PIN, autoState ? RELAY_ON : RELAY_OFF);
+    relayActive = autoState;
+    autoTimer = millis();
+
+    tft.fillRoundRect(SIDE_PAD, HDR_H + 52, tft.width()-2*SIDE_PAD, 44, 10, autoState ? ORANGE_ACCENT : ORANGE_BG);
+    tft.setTextColor(autoState ? TFT_BLACK : COLOR_TEXT, autoState ? ORANGE_ACCENT : ORANGE_BG);
+    tft.setTextSize(3);
+    tft.setTextDatum(MC_DATUM);
+    tft.drawString(autoState ? "POWER ON" : "POWER OFF", tft.width()/2, HDR_H + 74);
+    tft.setTextDatum(TL_DATUM);
+  }
+
+  float remain = (autoTimer + interval - millis()) / 1000.0f;
+  drawProgressBar(tft.width()/2, HDR_H + 120, tft.width()-2*SIDE_PAD, 12,
+                  remain / (interval/1000.0f), ORANGE_ACCENT, ORANGE_DARK);
+
+  if (!relayActive && buttonClickCount >= 3 && millis() - lastClickTime < 1000) {
+    firstRun = true;
+    activeMode = -1;
+    buttonClickCount = 0;
+    drawMainMenu();
+  }
+}
+
+/*********** Druck-Anzeige ***********/
+void drawPressureDisplayUI() {
+  tft.fillScreen(ORANGE_BG);
+  drawHeader();
+
+  tft.setTextColor(COLOR_TEXT, ORANGE_BG);
+  tft.setTextSize(2);
+  tft.drawString("DRUCK-ANZEIGE", SIDE_PAD, HDR_H + 8);
+  tft.drawFastHLine(SIDE_PAD, HDR_H + 28, tft.width() - 2*SIDE_PAD, ORANGE_ACCENT);
+
+  drawFooter("\x1A  Langer Druck: Zurück");
+}
+
+void runPressureDisplay() {
+  static unsigned long lastUpdate = 0;
+
+  if (millis() - lastUpdate > 400) {
+    // Balkenskala (400..500 kPa)
+    int gx = SIDE_PAD, gy = HDR_H + 40, gw = tft.width() - 2*SIDE_PAD, gh = 110;
+    tft.fillRect(gx, gy, gw, gh, ORANGE_DARK);
+    tft.drawRect(gx, gy, gw, gh, COLOR_TEXT);
+
+    tft.drawFastHLine(gx + 10, gy + gh/2, gw - 20, COLOR_TEXT);
+    for (int i = 0; i <= 5; i++) {
+      int x = gx + 10 + i * ((gw - 20) / 5);
+      tft.drawFastVLine(x, gy + gh/2, 10, COLOR_TEXT);
+      tft.setTextDatum(MC_DATUM);
+      tft.setTextSize(1);
+      tft.setTextColor(COLOR_TEXT, ORANGE_DARK);
+      char buf[8];
+      snprintf(buf, sizeof(buf), "%d", 400 + i*20);
+      tft.drawString(buf, x, gy + gh/2 + 16);
+    }
+
+    // Marker
+    float p = currentPressure;
+    if (p < TARGET_MIN) p = TARGET_MIN;
+    if (p > TARGET_MAX) p = TARGET_MAX;
+    int xTri = map((int)(p*10), (int)(TARGET_MIN*10), (int)(TARGET_MAX*10), gx + 10, gx + gw - 10);
+    uint16_t col = (currentPressure >= TARGET_MIN && currentPressure <= TARGET_MAX) ? COLOR_OK : COLOR_BAD;
+    tft.fillTriangle(xTri, gy + gh/2 - 18, xTri - 6, gy + gh/2 - 6, xTri + 6, gy + gh/2 - 6, col);
+
+    // Numerisches Feld
+    int nx = gx + (gw - 136)/2, ny = gy + gh + 8, nw = 136, nh = 26;
+    tft.fillRoundRect(nx, ny, nw, nh, 13, ORANGE_BG);
+    tft.drawRoundRect(nx, ny, nw, nh, 13, COLOR_TEXT);
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextColor(COLOR_TEXT, ORANGE_BG);
+    tft.setTextSize(2);
+    char nb[20];
+    snprintf(nb, sizeof(nb), "%.1f kPa", currentPressure);
+    tft.drawString(nb, nx + nw/2, ny + nh/2);
+
+    // Statuszeile
+    int sy = ny + nh + 6;
+    tft.fillRect(gx, sy, gw, 18, ORANGE_BG);
+    tft.setTextSize(1);
+    tft.setTextColor(col, ORANGE_BG);
+    tft.setTextDatum(MC_DATUM);
+    tft.drawString(
+      (currentPressure < TARGET_MIN) ? "Druck zu niedrig" :
+      (currentPressure > TARGET_MAX) ? "Druck zu hoch" :
+                                       "Druck OK",
+      gx + gw/2, sy + 9
+    );
+
+    lastUpdate = millis();
+    drawHeader(); // Header aktuell halten
+  }
+
+  // Joystick-Langdruck = zurück
+  if (digitalRead(JOY_SW) == LOW && millis() - lastButtonPress > 800) {
+    activeMode = -1;
+    drawMainMenu();
+  }
+}
+
+/*********** UI-Helfer ***********/
+void drawProgressBar(int cx, int y, int w, int h, float pct, uint16_t color, uint16_t bg) {
+  if (pct < 0) pct = 0;
+  if (pct > 1) pct = 1;
+  int x = cx - w/2;
+  tft.fillRect(x, y, w, h, bg);
+  tft.fillRect(x, y, (int)(w * pct), h, color);
+  tft.drawRect(x, y, w, h, COLOR_TEXT);
+}
+
+/*********** Relaissteuerung ***********/
+void activateRelay(uint16_t ms) {
+  digitalWrite(RELAY_PIN, RELAY_ON);
+  relayActive = true;
+  relayTimer = millis() + ms;
+}
+
+void checkRelayTimer() {
+  if (relayActive && millis() >= relayTimer) {
+    digitalWrite(RELAY_PIN, RELAY_OFF);
+    relayActive = false;
+  }
+}
+
+/*********** Touch-Bedienung im Hauptmenü ***********/
+void handleTouchMainMenu() {
+  uint16_t tx, ty;
+  if (!getTouch(tx, ty)) return;
+
+  int W = tft.width(), H = tft.height();
+  int itemH = 44;
+  int gap   = 10;
+  int totalH = (itemH * menuCount) + (gap * (menuCount - 1));
+  int startY = HDR_H + ((H - HDR_H - FTR_H) - totalH) / 2;
+
+  // Tippen in Liste → Auswahl/Start
+  if (ty >= startY && ty <= startY + totalH) {
+    int rel = ty - startY;
+    int slot = rel / (itemH + gap);
+    int inside = rel % (itemH + gap);
+    if (slot >= 0 && slot < menuCount && inside < itemH) {
+      currentSelection = slot;
+      drawMenuList();
+      // Direkt starten
+      activeMode = currentSelection;
+      showModeStartScreen(menuItems[currentSelection]);
+    }
+  }
+}
+
+/*********** Touch-Koordinaten erhalten ***********/
+bool getTouch(uint16_t &x, uint16_t &y) {
+#ifndef USE_CAP_TOUCH
+  // Resistiver Touch (TFT_eSPI integriert)
+  if (tft.getTouch(&x, &y)) {
+    // Bereits im Display-Koordinatensystem (Rotation beachtet)
+    return true;
+  }
+  return false;
+#else
+  // Kapazitiver Touch (FT6206)
+  if (!ctp.touched()) return false;
+  TS_Point p = ctp.getPoint();
+  // FT6206 liefert (x,y) vom Panel-Controller. Je nach Rotation mappen:
+  // Für PORTRAIT_ROTATION == 0 (häufig bei 240x320):
+  x = p.y;                // häufiges Mapping (abhängig von deinem Panel!)
+  y = 320 - p.x;          // ggf. anpassen, falls gespiegelt/gedreht
+  // Tipp: Im Kalibrier/Demo-Modus testen und ggf. swap/flip ändern.
+  return true;
+#endif
+}
